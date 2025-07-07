@@ -1,86 +1,74 @@
-name: Smart CI/CD with AutoFix & Root Cause Tagging
+name: Smart CI/CD with Auto-Fix and Log Classification
 
 on:
-  push:
-    branches: [main]
+  workflow_dispatch:
+
+env:
+  LOG_FILE: logs/build_output.log
+  PUSHGATEWAY_URL: http://your-pushgateway:9091
+  GITHUB_REPO: your-org/your-repo
 
 jobs:
-  categorize-failure:
-    name: Detect & Categorize Pipeline Failures
+
+  generate-logs:
+    name: Simulate CI/CD Pipeline Logs
     runs-on: ubuntu-latest
     outputs:
-      root_cause: ${{ steps.categorize.outputs.root_cause }}
+      log_path: ${{ steps.generate.outputs.log_path }}
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Run CI Tests
-        id: test
+      - name: Generate Fake Build/Test Logs
+        id: generate
         run: |
-          echo "Simulating CI failure..." && exit 1  # simulate failure
+          mkdir -p logs
+          echo "ERROR: Test failed at step X" > logs/build_output.log
+          echo "log_path=logs/build_output.log" >> $GITHUB_OUTPUT
 
-      - name: Categorize Failure
-        id: categorize
-        if: failure()
-        run: |
-          echo "import json; json.dump({'root_cause': 'infra', 'details': 'DNS timeout'}, open('root_cause.json', 'w'))" | python
-          echo "root_cause=infra" >> $GITHUB_OUTPUT
-
-      - name: Upload Root Cause Metadata
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: root-cause-tag
-          path: root_cause.json
-
-  autofix:
-    name: AutoFix Known Failures
+  classify-logs:
+    name: Analyze Logs and Classify Failure
     runs-on: ubuntu-latest
-    needs: categorize-failure
-    if: contains(fromJson('["infra", "config"]'), needs.categorize-failure.outputs.root_cause)
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Download Root Cause Metadata
-        uses: actions/download-artifact@v4
-        with:
-          name: root-cause-tag
-
-      - name: Run AutoFix Logic
-        run: |
-          python tools/autofix_engine.py root_cause.json
-
-      - name: Rerun Tests (Optional)
-        run: |
-          echo "Rerunning tests..." && ./rerun-tests.sh || echo "AutoFix failed."
-
-  notify:
-    name: Notify & Log
-    runs-on: ubuntu-latest
-    needs: [categorize-failure, autofix]
-    if: always()
+    needs: generate-logs
+    outputs:
+      failure_type: ${{ steps.classify.outputs.failure_type }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Download Metadata
+      - name: Classify Failure
+        id: classify
+        run: |
+          mkdir -p analysis
+          echo "import json; json.dump({'failure_type': 'test'}, open('analysis/failure.json','w'))" | python
+          echo "failure_type=test" >> $GITHUB_OUTPUT
+
+      - name: Upload Classification
+        uses: actions/upload-artifact@v4
+        with:
+          name: failure-classification
+          path: analysis/failure.json
+
+  auto-fix:
+    name: Auto-Fix Classified Failure
+    runs-on: ubuntu-latest
+    needs: classify-logs
+    if: ${{ needs.classify-logs.outputs.failure_type != '' }}
+    steps:
+      - name: Download Classification
         uses: actions/download-artifact@v4
         with:
-          name: root-cause-tag
+          name: failure-classification
 
-      - name: Notify Slack
-        uses: slackapi/slack-github-action@v1.26.0
-        with:
-          channel-id: 'ci-alerts'
-          bot-token: ${{ secrets.SLACK_BOT_TOKEN }}
-          payload: |
-            {
-              "text": "🔍 Root cause: ${{ needs.categorize-failure.outputs.root_cause || 'N/A' }}\n🔧 AutoFix: ${{ needs.autofix.result || 'skipped' }}"
-            }
-
-      - name: Log to Monitoring
+      - name: Trigger and Run Fix
         run: |
-          curl -X POST https://monitoring.example.com/log \
-          -H "Content-Type: application/json" \
-          -d @root_cause.json
+          python tools/fix_engine.py analysis/failure.json
+
+  log-results:
+    name: Log Fix Results and Metrics
+    runs-on: ubuntu-latest
+    needs: auto-fix
+    steps:
+      - name: Log Result
+        run: echo "📋 AutoFix completed."
+
+      - name: Push Metrics to Prometheus
+        run: |
+          echo "ci_pipeline_fix_success{job=\"autofix\"} 1" | curl --data-binary @- $PUSHGATEWAY_URL/metrics/job/autofix
